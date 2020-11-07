@@ -59,7 +59,7 @@ mypy:
 
 .PHONY: test
 test:
-	pytest --cov=pydantic
+	pytest -p "no:hypothesispytest" --cov=pydantic
 
 .PHONY: testcov
 testcov: test
