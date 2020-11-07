@@ -1,3 +1,5 @@
+import typing
+
 import pytest
 from hypothesis import given, settings, strategies as st
 
@@ -13,7 +15,17 @@ class MiscModel(pydantic.BaseModel):
     color: pydantic.color.Color
 
 
+class JsonModel(pydantic.BaseModel):
+    json_any: pydantic.Json
+    json_int: pydantic.Json[int]
+    json_float: pydantic.Json[float]
+    json_str: pydantic.Json[str]
+    json_int_or_str: pydantic.Json[typing.Union[int, str]]
+    json_list_of_float: pydantic.Json[typing.List[float]]
+
+
 class StringsModel(pydantic.BaseModel):
+    card: pydantic.PaymentCardNumber
     uuid1: pydantic.UUID1
     uuid3: pydantic.UUID3
     uuid4: pydantic.UUID4
@@ -34,11 +46,29 @@ class IPvAnyNetwork(pydantic.BaseModel):
     network: pydantic.IPvAnyNetwork
 
 
+class URLsModel(pydantic.BaseModel):
+    anyurl: pydantic.AnyUrl
+    anyhttp: pydantic.AnyHttpUrl
+    http: pydantic.HttpUrl
+    postgres: pydantic.PostgresDsn
+    redis: pydantic.RedisDsn
+
+
 class StrictNumbersModel(pydantic.BaseModel):
     strictbool: pydantic.StrictBool
     strictint: pydantic.StrictInt
     strictfloat: pydantic.StrictFloat
     strictstr: pydantic.StrictStr
+
+
+class NumbersModel(pydantic.BaseModel):
+    conintt: pydantic.conint(gt=10, lt=100)
+    coninte: pydantic.conint(ge=10, le=100)
+    conintmul: pydantic.conint(ge=10, le=100, multiple_of=7)
+    confloatt: pydantic.confloat(gt=10, lt=100)
+    confloate: pydantic.confloat(ge=10, le=100)
+    condecimalt: pydantic.condecimal(gt=10, lt=100)
+    condecimale: pydantic.condecimal(ge=10, le=100)
 
 
 class ConBytesModel(pydantic.BaseModel):
@@ -90,18 +120,41 @@ else:
         name_email: pydantic.NameEmail
 
 
+class CollectionsModel(pydantic.BaseModel):
+    conset: pydantic.conset(int, min_items=2, max_items=4)
+    conlist: pydantic.conlist(int, min_items=2, max_items=4)
+
+
+class Foo:
+    # Trivial class to test constrained collections element type
+    pass
+
+
+class CollectionsFooModel(pydantic.BaseModel):
+    conset: pydantic.conset(Foo, min_items=2, max_items=4)
+    conlist: pydantic.conlist(Foo, min_items=2, max_items=4)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
 @pytest.mark.parametrize(
     """model""",
     [
         EmailsModel,
         MiscModel,
+        JsonModel,
         StringsModel,
         IPvAnyAddress,
         IPvAnyInterface,
         IPvAnyNetwork,
+        URLsModel,
+        NumbersModel,
         StrictNumbersModel,
         ConBytesModel,
         ConStringsModel,
+        CollectionsModel,
+        CollectionsFooModel,
     ],
 )
 @settings(max_examples=20)

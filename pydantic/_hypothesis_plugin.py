@@ -22,7 +22,9 @@ ConstrainedInt to generate normal ints (which match the constraints), etc.
 """
 
 import ipaddress
+import json
 import math
+from fractions import Fraction
 from functools import partial
 from typing import cast
 
@@ -30,7 +32,7 @@ import hypothesis.strategies as st
 
 import pydantic
 import pydantic.color
-from pydantic.networks import import_email_validator
+from pydantic.networks import ascii_domain_regex, import_email_validator, int_domain_regex
 
 # FilePath and DirectoryPath are explicitly unsupported, as we'd have to create
 # them on-disk, and that's unsafe in general without being told *where* to do so.
@@ -84,6 +86,116 @@ st.register_type_strategy(
     ),
 )
 
+# JSON strings, optionally constrained to a particular type.  We have to register
+# separate strategies for these cases because they're distinct types at runtime.
+st.register_type_strategy(
+    pydantic.Json,
+    st.builds(
+        json.dumps,  # type: ignore[arg-type]
+        st.recursive(
+            base=st.one_of(
+                st.none(),
+                st.booleans(),
+                st.integers(),
+                st.floats(allow_infinity=False, allow_nan=False),
+                st.text(),
+            ),
+            extend=lambda x: st.lists(x) | st.dictionaries(st.text(), x),
+        ),
+        ensure_ascii=st.booleans(),
+        indent=st.none() | st.integers(0, 16),
+        sort_keys=st.booleans(),
+    ),
+)
+
+
+@partial(st.register_type_strategy, pydantic.JsonWrapper)
+def resolve_jsonwrapper(cls):  # type: ignore[no-untyped-def]
+    return st.builds(
+        json.dumps,
+        st.from_type(cls.inner_type),
+        ensure_ascii=st.booleans(),
+        indent=st.none() | st.integers(0, 16),
+        sort_keys=st.booleans(),
+    )
+
+
+# Card numbers, valid according to the Luhn algorithm
+
+
+def fix_luhn_digit(card_number: str) -> str:
+    # See https://en.wikipedia.org/wiki/Luhn_algorithm
+    assert card_number[-1] == 'X', 'expected placeholder check digit'
+    for digit in '0123456789':
+        try:
+            card_number = card_number[:-1] + digit
+            pydantic.PaymentCardNumber.validate_luhn_check_digit(card_number)
+            return card_number
+        except pydantic.ValidationError:
+            continue
+    raise AssertionError('Should be unreachable')
+
+
+card_patterns = (
+    '4[0-9]{14}X',  # Visa
+    '5[12345][0-9]{13}X',  # Mastercard
+    '3[47][0-9]{12}X',  # American Express
+    '[0-9]{11,18}X',  # other
+)
+st.register_type_strategy(
+    pydantic.PaymentCardNumber,
+    st.from_regex('|'.join(card_patterns), fullmatch=True).map(fix_luhn_digit),  # type: ignore[arg-type]
+)
+
+# URLs
+
+
+def resolve_anyurl(cls):  # type: ignore[no-untyped-def]
+    domains = st.one_of(
+        st.from_regex(ascii_domain_regex(), fullmatch=True),
+        st.from_regex(int_domain_regex(), fullmatch=True),
+    )
+    if cls.tld_required:
+
+        def has_tld(s: str) -> bool:
+            assert isinstance(s, str)
+            match = ascii_domain_regex().fullmatch(s) or int_domain_regex().fullmatch(s)
+            return bool(match and match.group('tld'))
+
+        hosts = domains.filter(has_tld)
+    else:
+        hosts = domains | st.from_regex(
+            r'(?P<ipv4>(?:\d{1,3}\.){3}\d{1,3})' r'|(?P<ipv6>\[[A-F0-9]*:[A-F0-9:]+\])',
+            fullmatch=True,
+        )
+
+    return st.builds(
+        cls.build,
+        scheme=(
+            st.sampled_from(sorted(cls.allowed_schemes))
+            if cls.allowed_schemes
+            else st.from_regex(r'(?P<scheme>[a-z][a-z0-9+\-.]+)', fullmatch=True)
+        ),
+        user=st.one_of(
+            st.nothing() if cls.user_required else st.none(),
+            st.from_regex(r'(?P<user>[^\s:/]+)', fullmatch=True),
+        ),
+        password=st.none() | st.from_regex(r'(?P<password>[^\s/]*)', fullmatch=True),
+        host=hosts,
+        port=st.none() | st.integers(0, 2 ** 16 - 1).map(str),
+        path=st.none() | st.from_regex(r'(?P<path>/[^\s?]*)', fullmatch=True),
+        query=st.none() | st.from_regex(r'(?P<query>[^\s#]+)', fullmatch=True),
+        fragment=st.none() | st.from_regex(r'(?P<fragment>\S+)', fullmatch=True),
+    ).filter(lambda url: cls.min_length <= len(url) <= cls.max_length)
+
+
+st.register_type_strategy(pydantic.AnyUrl, resolve_anyurl)
+st.register_type_strategy(pydantic.AnyHttpUrl, resolve_anyurl)
+st.register_type_strategy(pydantic.HttpUrl, resolve_anyurl)
+st.register_type_strategy(pydantic.PostgresDsn, resolve_anyurl)
+st.register_type_strategy(pydantic.RedisDsn, resolve_anyurl)
+
+
 # UUIDs
 st.register_type_strategy(pydantic.UUID1, st.uuids(version=1))  # type: ignore[arg-type]
 st.register_type_strategy(pydantic.UUID3, st.uuids(version=3))  # type: ignore[arg-type]
@@ -131,6 +243,85 @@ def resolve_conbytes(cls):  # type: ignore[no-untyped-def]  # pragma: no cover
         assert min_size == 0
         pattern = rf'(\W(.{repeats}\W)?)?'
     return st.from_regex(pattern.encode(), fullmatch=True)
+
+
+@partial(st.register_type_strategy, pydantic.ConstrainedDecimal)
+def resolve_condecimal(cls):  # type: ignore[no-untyped-def]
+    min_value = cls.ge
+    max_value = cls.le
+    if cls.gt is not None:
+        assert min_value is None, 'Set `gt` or `ge`, but not both'
+        min_value = cls.gt
+    if cls.lt is not None:
+        assert max_value is None, 'Set `lt` or `le`, but not both'
+        max_value = cls.lt
+    # max_digits, decimal_places, and multiple_of are handled via the filter
+    return st.decimals(min_value, max_value, allow_nan=False).filter(cls.validate)
+
+
+@partial(st.register_type_strategy, pydantic.ConstrainedFloat)
+def resolve_confloat(cls):  # type: ignore[no-untyped-def]
+    min_value = cls.ge
+    max_value = cls.le
+    exclude_min = False
+    exclude_max = False
+    if cls.gt is not None:
+        assert min_value is None, 'Set `gt` or `ge`, but not both'
+        min_value = cls.gt
+        exclude_min = True
+    if cls.lt is not None:
+        assert max_value is None, 'Set `lt` or `le`, but not both'
+        max_value = cls.lt
+        exclude_max = True
+    # multiple_of is handled via the filter
+    return st.floats(
+        min_value,
+        max_value,
+        exclude_min=exclude_min,
+        exclude_max=exclude_max,
+        allow_nan=False,
+    ).filter(cls.validate)
+
+
+@partial(st.register_type_strategy, pydantic.ConstrainedInt)
+def resolve_conint(cls):  # type: ignore[no-untyped-def]
+    min_value = cls.ge
+    max_value = cls.le
+    if cls.gt is not None:
+        assert min_value is None, 'Set `gt` or `ge`, but not both'
+        min_value = cls.gt + 1
+    if cls.lt is not None:
+        assert max_value is None, 'Set `lt` or `le`, but not both'
+        max_value = cls.lt - 1
+
+    if cls.multiple_of is None or cls.multiple_of == 1:
+        return st.integers(min_value, max_value)
+
+    # These adjustments and the .map handle integer-valued multiples, while the
+    # .filter handles trickier cases as for confloat.
+    if min_value is not None:
+        min_value = math.ceil(Fraction(min_value) / Fraction(cls.multiple_of))
+    if max_value is not None:
+        max_value = math.floor(Fraction(max_value) / Fraction(cls.multiple_of))
+    return st.integers(min_value, max_value).map(lambda x: x * cls.multiple_of).filter(cls.validate)
+
+
+@partial(st.register_type_strategy, pydantic.ConstrainedList)
+def resolve_conlist(cls):  # type: ignore[no-untyped-def]
+    return st.lists(
+        st.from_type(cls.item_type),
+        min_size=cls.min_items,
+        max_size=cls.max_items,
+    )
+
+
+@partial(st.register_type_strategy, pydantic.ConstrainedSet)
+def resolve_conset(cls):  # type: ignore[no-untyped-def]
+    return st.sets(
+        st.from_type(cls.item_type),
+        min_size=cls.min_items,
+        max_size=cls.max_items,
+    )
 
 
 @partial(st.register_type_strategy, pydantic.ConstrainedStr)
